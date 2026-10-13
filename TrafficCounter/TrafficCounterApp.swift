@@ -6,12 +6,14 @@
 //
 
 import SwiftUI
+import Combine
+
 
 @main
 struct TrafficCounterApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(userId: 2, userName: "test@example.com")
         }
     }
 }
