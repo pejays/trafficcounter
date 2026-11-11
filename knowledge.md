@@ -78,4 +78,6 @@ Living notes about the system. Update whenever a fact changes.
 - Live automatic-session counts use an `auto_session_id` conflict upsert. A
   final desktop snapshot is written when an active session transitions out of
   the active window, including when the website closes it first.
+- Camera Enable/Disable is stored as `cameras.status` (`online`/`offline`) so
+  the desktop and VehiSights website reflect the same availability state.
 

@@ -40,3 +40,16 @@ Checklist source: .freebuff/skills/trafficcounter-verify.md
 | Active-session camera selection stability build check | Passed |
 | Live-count upsert and active-session final snapshot build check | Passed |
 
+# Camera availability synchronization — 2026-11-11
+
+- `CameraFeedView` Disable/Enable now PATCHes the shared `cameras.status`
+  record (`offline` / `online`) before applying the corresponding local RTSP
+  and counting state.
+- Failed remote writes leave the local camera state unchanged and surface an
+  inline error in the camera inspector.
+- Camera polling preserves known local camera UUIDs and credentials while
+  applying website status changes, avoiding a needless RTSP feed restart.
+- Verified: `xcodebuild -project TrafficCounter.xcodeproj -scheme
+  TrafficCounter -configuration Debug -sdk macosx build CODE_SIGNING_ALLOWED=NO`
+  completed successfully.
+

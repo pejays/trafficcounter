@@ -89,7 +89,7 @@ struct CameraView: View {
                     CameraFeedView(
                         cameraHandler: cameraHandler,
                         sessionCoordinator: sessionCoordinator,
-                        selectedCamera: .constant(selectedCamera),
+                        selectedCamera: $selectedCamera,
                         activeSchedule: $activeSchedule,          // <--- ADD THIS
                         scheduledSessionCode: $scheduledSessionCode, // <--- ADD THIS
                         shouldMaintainFeed: $shouldMaintainFeed,
@@ -117,14 +117,12 @@ struct CameraView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
-            // Force the camera state to true so the feed starts when the app opens
-            AppState.shared.isCameraEnabled = true
-            
             // Initial load
             loadCameras()
             if cameras.isEmpty == false && selectedCamera == nil {
                 selectedCamera = cameras.first
             }
+            AppState.shared.isCameraEnabled = selectedCamera?.isEnabled ?? true
             
             fetchCamerasFromSupabase()
             
@@ -142,6 +140,9 @@ struct CameraView: View {
             guard let cameraID,
                   let assigned = cameras.first(where: { $0.remoteId == cameraID }) else { return }
             selectCameraIfNeeded(assigned)
+        }
+        .onChange(of: selectedCamera?.isEnabled) { _, isEnabled in
+            AppState.shared.isCameraEnabled = isEnabled ?? true
         }
         .sheet(isPresented: $showingAddCameraSheet) {
             AddCameraSheet(
@@ -170,20 +171,33 @@ struct CameraView: View {
                 case .success(let remoteCameras):
                     let localCameras = remoteCameras.map { remote in
                         let savedPassword = UserDefaults.standard.string(forKey: "password_\(remote.id)") ?? "admin"
-                        
+                        let isEnabled = remote.status?.lowercased() != "offline"
+
+                        // Retain the desktop UUID and credentials for known cameras.
+                        // Replacing them on every poll recreates the feed view and can
+                        // interrupt RTSP even when only website status changed.
+                        if var existing = self.cameras.first(where: { $0.remoteId == remote.id }) {
+                            existing.name = remote.name
+                            existing.isEnabled = isEnabled
+                            return existing
+                        }
+
                         return Camera(
                             name: remote.name,
                             remoteId: remote.id,
                             ip: remote.ip_address ?? "",
                             username: "admin",
-                            password: savedPassword
+                            password: savedPassword,
+                            isEnabled: isEnabled
                         )
                     }
                     
                     // Only update the UI if the data actually changed (prevents video feed from restarting)
                     let hasChanged = localCameras.count != self.cameras.count ||
                                      zip(localCameras, self.cameras).contains(where: {
-                                         $0.remoteId != $1.remoteId || $0.name != $1.name
+                                         $0.remoteId != $1.remoteId ||
+                                         $0.name != $1.name ||
+                                         $0.isEnabled != $1.isEnabled
                                      })
                     
                     if hasChanged {
@@ -193,6 +207,9 @@ struct CameraView: View {
                         // If the currently selected camera was deleted, reset it
                         if let selected = self.selectedCamera, !localCameras.contains(where: { $0.id == selected.id }) {
                             self.selectedCamera = localCameras.first
+                        } else if let selected = self.selectedCamera,
+                                  let refreshed = localCameras.first(where: { $0.id == selected.id }) {
+                            self.selectedCamera = refreshed
                         } else if self.selectedCamera == nil {
                             self.selectedCamera = localCameras.first
                         }

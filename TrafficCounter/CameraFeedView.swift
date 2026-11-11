@@ -11,6 +11,9 @@ struct CameraFeedView: View {
     @Binding var shouldMaintainFeed: Bool
     @State private var selectedSchedule: RemoteAutoSession?
     @State private var now = Date()
+    @State private var isUpdatingCameraStatus = false
+    @State private var cameraStatusMessage: String?
+    @State private var cameraStatusUpdateFailed = false
     let userId: Int
     let userName: String
     private let liveUploadTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
@@ -61,6 +64,17 @@ struct CameraFeedView: View {
             startFeedIfNeeded()
             synchronizeCountingState(resetForNewSession: true)
         }
+        .onChange(of: selectedCamera?.isEnabled) { _, isEnabled in
+            guard let isEnabled else { return }
+            appState.isCameraEnabled = isEnabled
+            if isEnabled {
+                startFeedIfNeeded()
+                synchronizeCountingState(resetForNewSession: false)
+            } else {
+                cameraHandler.toggleCounting(isActive: false)
+                cameraHandler.stopCamera()
+            }
+        }
         .onReceive(liveUploadTimer) { _ in if isAssignedActiveCamera { Task { await sessionCoordinator.submitCounts(orderedCounts) } } }
         .onReceive(clock) { now = $0 }
         .onDisappear { cameraHandler.stopCamera() }
@@ -77,7 +91,15 @@ struct CameraFeedView: View {
             }
             Spacer()
             connectionBadge
-            Button(action: toggleCamera) { Label(appState.isCameraEnabled ? "Disable" : "Enable", systemImage: appState.isCameraEnabled ? "video.slash" : "video") }.buttonStyle(.bordered)
+            Button(action: toggleCamera) {
+                if isUpdatingCameraStatus {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Label(appState.isCameraEnabled ? "Disable" : "Enable", systemImage: appState.isCameraEnabled ? "video.slash" : "video")
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(isUpdatingCameraStatus || selectedCamera == nil)
         }.padding(.horizontal, 24).padding(.vertical, 16)
     }
 
@@ -112,6 +134,11 @@ struct CameraFeedView: View {
                 analyticsCard
                 classificationCard
                 schedulesCard
+                if let message = cameraStatusMessage {
+                    Label(message, systemImage: cameraStatusUpdateFailed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundColor(cameraStatusUpdateFailed ? .orange : .green)
+                }
                 if let error = sessionCoordinator.lastError { Label(error, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundColor(.orange) }
                 if let error = cameraHandler.lastError { Label(error, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundColor(.orange) }
             }.padding(.vertical, 4).padding(.trailing, 16)
@@ -154,9 +181,53 @@ struct CameraFeedView: View {
     private var losColor: Color { ["A": .green, "B": .mint, "C": .yellow, "D": .orange, "E": .red, "F": .purple][los] ?? .secondary }
     private func countdown(to session: RemoteAutoSession) -> String { guard let start = SessionDateParser.parse(session.startTime) else { return "Scheduled" }; let seconds = max(0, Int(start.timeIntervalSince(now))); return seconds == 0 ? "Starting now" : String(format: "Starts in %02d:%02d", seconds / 60, seconds % 60) }
     private func formattedStart(_ session: RemoteAutoSession) -> String { guard let date = SessionDateParser.parse(session.startTime) else { return session.startTime }; return date.formatted(date: .omitted, time: .shortened) }
-    private func toggleCamera() { guard var camera = selectedCamera else { return }; if appState.isCameraEnabled { cameraHandler.stopCamera(); appState.isCameraEnabled = false; camera.isEnabled = false } else { cameraHandler.startCamera(); appState.isCameraEnabled = true; camera.isEnabled = true }; NotificationCenter.default.post(name: NSNotification.Name("UpdateCameraState"), object: camera) }
+    private func toggleCamera() {
+        guard let camera = selectedCamera else { return }
+        let nextState = !camera.isEnabled
+
+        // A camera that exists only locally has no website record to update.
+        guard let remoteID = camera.remoteId else {
+            applyCameraState(nextState, to: camera)
+            return
+        }
+
+        isUpdatingCameraStatus = true
+        cameraStatusMessage = nil
+        SupabaseManager.shared.updateCameraStatus(id: remoteID, isEnabled: nextState) { result in
+            DispatchQueue.main.async {
+                self.isUpdatingCameraStatus = false
+                switch result {
+                case .success:
+                    self.applyCameraState(nextState, to: camera)
+                    self.cameraStatusUpdateFailed = false
+                    self.cameraStatusMessage = nextState
+                        ? "Camera enabled on VehiSights."
+                        : "Camera disabled on VehiSights."
+                case .failure(let error):
+                    self.cameraStatusUpdateFailed = true
+                    self.cameraStatusMessage = "Could not update VehiSights: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func applyCameraState(_ isEnabled: Bool, to camera: Camera) {
+        var updatedCamera = camera
+        updatedCamera.isEnabled = isEnabled
+        selectedCamera = updatedCamera
+        appState.isCameraEnabled = isEnabled
+
+        if isEnabled {
+            startFeedIfNeeded()
+            synchronizeCountingState(resetForNewSession: false)
+        } else {
+            cameraHandler.toggleCounting(isActive: false)
+            cameraHandler.stopCamera()
+        }
+    }
+
     private func startFeedIfNeeded() {
-        guard shouldRunFeed, let camera = selectedCamera else { return }
+        guard shouldRunFeed, let camera = selectedCamera, camera.isEnabled else { return }
         cameraHandler.saveCameraToUserDefaults(name: camera.name, ip: camera.ip, username: camera.username, password: camera.password)
         cameraHandler.startCamera()
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
@@ -165,7 +236,14 @@ struct CameraFeedView: View {
             cameraHandler.updateCountingLine(position: savedPosition == 0 ? 0.7 : savedPosition)
         }
     }
-    private func synchronizeCountingState(resetForNewSession: Bool) { if isAssignedActiveCamera { appState.isCameraEnabled = true; if resetForNewSession { cameraHandler.resetCounts() }; cameraHandler.toggleCounting(isActive: true) } else { cameraHandler.toggleCounting(isActive: false) } }
+    private func synchronizeCountingState(resetForNewSession: Bool) {
+        guard selectedCamera?.isEnabled != false, isAssignedActiveCamera else {
+            cameraHandler.toggleCounting(isActive: false)
+            return
+        }
+        if resetForNewSession { cameraHandler.resetCounts() }
+        cameraHandler.toggleCounting(isActive: true)
+    }
 }
 
 @MainActor private struct ScheduleMiniCard: View {

@@ -134,6 +134,52 @@ class SupabaseManager {
             }
         }.resume()
     }
+
+    /// Keeps the camera availability shown by VehiSights in sync with the
+    /// operator's Enable/Disable control in the desktop app.
+    func updateCameraStatus(id: Int, isEnabled: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let url = URL(string: "\(supabaseURL)/rest/v1/cameras?id=eq.\(id)") else {
+            completion(.failure(NSError(
+                domain: "Supabase",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid camera status request."]
+            )))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.allHTTPHeaderFields = defaultHeaders
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "status": isEnabled ? "online" : "offline"
+            ])
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode) else {
+                let message = String(data: data ?? Data(), encoding: .utf8) ?? "Unknown error"
+                completion(.failure(NSError(
+                    domain: "Supabase",
+                    code: (response as? HTTPURLResponse)?.statusCode ?? -1,
+                    userInfo: [NSLocalizedDescriptionKey: message]
+                )))
+                return
+            }
+
+            completion(.success(()))
+        }.resume()
+    }
     
     // MARK: - Delete
     func deleteCamera(id: Int, completion: @escaping (Result<Void, Error>) -> Void) {
