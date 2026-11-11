@@ -8,6 +8,11 @@ struct SupabaseCameraResponse: Codable {
     let status: String?
 }
 
+struct CameraStatusResponse: Codable {
+    let id: Int
+    let status: String
+}
+
 class SupabaseManager {
     static let shared = SupabaseManager()
     
@@ -135,49 +140,106 @@ class SupabaseManager {
         }.resume()
     }
 
-    /// Keeps the camera availability shown by VehiSights in sync with the
-    /// operator's Enable/Disable control in the desktop app.
-    func updateCameraStatus(id: Int, isEnabled: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
-        guard let url = URL(string: "\(supabaseURL)/rest/v1/cameras?id=eq.\(id)") else {
+    func updateCameraStatus(
+        id: Int,
+        isEnabled: Bool,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard let url = URL(
+            string: "\(supabaseURL)/rest/v1/rpc/set_camera_status"
+        ) else {
             completion(.failure(NSError(
                 domain: "Supabase",
                 code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid camera status request."]
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Invalid camera status request."
+                ]
             )))
             return
         }
 
+        let expectedStatus = isEnabled ? "online" : "offline"
+
         var request = URLRequest(url: url)
-        request.httpMethod = "PATCH"
+        request.httpMethod = "POST"
         request.allHTTPHeaderFields = defaultHeaders
 
         do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: [
-                "status": isEnabled ? "online" : "offline"
-            ])
+            request.httpBody = try JSONSerialization.data(
+                withJSONObject: [
+                    "camera_id": id,
+                    "new_status": expectedStatus
+                ],
+                options: []
+            )
         } catch {
             completion(.failure(error))
             return
         }
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        URLSession.shared.dataTask(with: request) {
+            data,
+            response,
+            error in
+
             if let error {
                 completion(.failure(error))
                 return
             }
 
-            guard let http = response as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode) else {
-                let message = String(data: data ?? Data(), encoding: .utf8) ?? "Unknown error"
+            guard let httpResponse = response as? HTTPURLResponse else {
                 completion(.failure(NSError(
                     domain: "Supabase",
-                    code: (response as? HTTPURLResponse)?.statusCode ?? -1,
-                    userInfo: [NSLocalizedDescriptionKey: message]
+                    code: -1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Supabase returned an invalid response."
+                    ]
                 )))
                 return
             }
 
-            completion(.success(()))
+            guard (200...299).contains(httpResponse.statusCode) else {
+                let errorMessage = String(
+                    data: data ?? Data(),
+                    encoding: .utf8
+                ) ?? "Unknown Supabase error."
+
+                completion(.failure(NSError(
+                    domain: "Supabase",
+                    code: httpResponse.statusCode,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: errorMessage
+                    ]
+                )))
+                return
+            }
+
+            do {
+                let updatedCamera = try JSONDecoder().decode(
+                    CameraStatusResponse.self,
+                    from: data ?? Data()
+                )
+
+                guard updatedCamera.id == id,
+                      updatedCamera.status.lowercased() == expectedStatus
+                else {
+                    completion(.failure(NSError(
+                        domain: "Supabase",
+                        code: httpResponse.statusCode,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Supabase returned an unexpected camera status."
+                        ]
+                    )))
+                    return
+                }
+
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
         }.resume()
     }
     

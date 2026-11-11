@@ -80,4 +80,7 @@ Living notes about the system. Update whenever a fact changes.
   the active window, including when the website closes it first.
 - Camera Enable/Disable is stored as `cameras.status` (`online`/`offline`) so
   the desktop and VehiSights website reflect the same availability state.
+- Camera schedule and active-session countdowns use a view-bound one-second
+  task rather than a recreated Combine publisher, so time remaining continues
+  to update while the camera console redraws.
 

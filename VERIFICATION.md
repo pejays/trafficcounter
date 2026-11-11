@@ -53,3 +53,9 @@ Checklist source: .freebuff/skills/trafficcounter-verify.md
   TrafficCounter -configuration Debug -sdk macosx build CODE_SIGNING_ALLOWED=NO`
   completed successfully.
 
+# Camera countdown refresh — 2026-11-12
+
+- Replaced the camera console's stored Combine countdown publisher with a
+  view-bound Swift concurrency task that refreshes the displayed clock once
+  per second through normal SwiftUI redraws.
+

@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import Foundation
 
 struct CameraFeedView: View {
     @ObservedObject var cameraHandler: PythonCameraHandler
@@ -17,7 +18,6 @@ struct CameraFeedView: View {
     let userId: Int
     let userName: String
     private let liveUploadTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-    private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     private let categories = ["Private Car", "Jeepney", "UV", "Bus/Minibus", "Light Truck", "Heavy Truck", "Motorcycle", "Tricycle"]
     private let factorByKey: [String: Double] = ["private car": 1.0, "jeepney": 1.5, "uv": 1.5, "bus-minibus": 2.5, "light truck": 2.0, "heavy truck": 3.0, "motorcycle": 0.5, "tricycle": 0.7]
@@ -76,7 +76,15 @@ struct CameraFeedView: View {
             }
         }
         .onReceive(liveUploadTimer) { _ in if isAssignedActiveCamera { Task { await sessionCoordinator.submitCounts(orderedCounts) } } }
-        .onReceive(clock) { now = $0 }
+        // Keep countdown text driven by a task owned by this view. A Combine
+        // publisher stored in a SwiftUI value can be recreated during redraws,
+        // leaving its displayed countdown frozen.
+        .task {
+            while !Task.isCancelled {
+                now = Date()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
         .onDisappear { cameraHandler.stopCamera() }
         .sheet(item: $selectedSchedule) { session in
             CameraScheduleDetailView(session: session)
@@ -87,7 +95,19 @@ struct CameraFeedView: View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
                 Text(selectedCamera?.name ?? "Camera console").font(.title.bold())
-                Text(isAssignedActiveCamera ? "Automatic session is active - counts are syncing every 2 seconds" : nextScheduledSession.map { "Next automatic session \(countdown(to: $0))" } ?? "Live preview - waiting for a website schedule assigned to this camera").font(.subheadline).foregroundColor(.secondary)
+                if let activeSession = activeCameraSession {
+                    Text("Automatic session is active — \(endCountdown(to: activeSession))")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                } else if let scheduledSession = nextScheduledSession {
+                    Text("Next automatic session \(countdown(to: scheduledSession))")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("Live preview — waiting for a website schedule assigned to this camera")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
             }
             Spacer()
             connectionBadge
@@ -147,11 +167,59 @@ struct CameraFeedView: View {
 
     private var sessionCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack { Label(isAssignedActiveCamera ? "COUNTING NOW" : (nextScheduledSession == nil ? "SESSION STATUS" : "UP NEXT"), systemImage: isAssignedActiveCamera ? "record.circle.fill" : "clock").font(.caption.weight(.bold)).foregroundColor(isAssignedActiveCamera ? .red : (nextScheduledSession == nil ? .secondary : .orange)); Spacer(); Text(isAssignedActiveCamera ? "LIVE" : (nextScheduledSession == nil ? "STANDBY" : countdown(to: nextScheduledSession!))).font(.caption.bold().monospacedDigit()).foregroundColor(isAssignedActiveCamera ? .red : (nextScheduledSession == nil ? .secondary : .orange)) }
-            if let session = activeCameraSession { Text(session.sessionCode).font(.headline); Text("\(session.roadName ?? session.location) - \(session.direction ?? "Direction not set")").font(.caption).foregroundColor(.secondary); Text("Capacity: \(Int(capacity)) PCU/hr").font(.caption).foregroundColor(.secondary) }
-            else if let session = nextScheduledSession { Text(session.schedule?.scheduleName ?? session.sessionCode).font(.headline); Text("\(session.roadName ?? session.location) - \(session.direction ?? "Direction not set")").font(.caption).foregroundColor(.secondary); Text("Starts \(formattedStart(session)) • Capacity: \(Int(capacity)) PCU/hr").font(.caption).foregroundColor(.secondary) }
-            else { Text("No active session for this camera").font(.subheadline); Text("Sessions created on the VehiSight website appear automatically.").font(.caption).foregroundColor(.secondary) }
-        }.padding(14).background((isAssignedActiveCamera ? Color.red : (nextScheduledSession == nil ? Color.gray : Color.orange)).opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+            HStack {
+                Label(
+                    isAssignedActiveCamera ? "COUNTING NOW" : (nextScheduledSession == nil ? "SESSION STATUS" : "UP NEXT"),
+                    systemImage: isAssignedActiveCamera ? "record.circle.fill" : "clock"
+                )
+                .font(.caption.weight(.bold))
+                .foregroundColor(isAssignedActiveCamera ? .red : (nextScheduledSession == nil ? .secondary : .orange))
+
+                Spacer()
+
+                if let activeSession = activeCameraSession {
+                    Text(endCountdown(to: activeSession))
+                        .font(.caption.bold().monospacedDigit())
+                        .foregroundColor(.red)
+                } else if let scheduledSession = nextScheduledSession {
+                    Text(countdown(to: scheduledSession))
+                        .font(.caption.bold().monospacedDigit())
+                        .foregroundColor(.orange)
+                } else {
+                    Text("STANDBY")
+                        .font(.caption.bold())
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if let session = activeCameraSession {
+                Text(session.sessionCode).font(.headline)
+                Text("\(session.roadName ?? session.location) — \(session.direction ?? "Direction not set")")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text("Ends \(formattedEnd(session)) • Capacity: \(Int(capacity)) PCU/hr")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else if let session = nextScheduledSession {
+                Text(session.schedule?.scheduleName ?? session.sessionCode).font(.headline)
+                Text("\(session.roadName ?? session.location) — \(session.direction ?? "Direction not set")")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text("Starts \(formattedStart(session)) • Capacity: \(Int(capacity)) PCU/hr")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                Text("No active session for this camera").font(.subheadline)
+                Text("Sessions created on the VehiSight website appear automatically.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(14)
+        .background(
+            (isAssignedActiveCamera ? Color.red : (nextScheduledSession == nil ? Color.gray : Color.orange)).opacity(0.10),
+            in: RoundedRectangle(cornerRadius: 14)
+        )
     }
 
     private var analyticsCard: some View {
@@ -179,8 +247,47 @@ struct CameraFeedView: View {
 
     private func metric(_ title: String, _ value: String, _ icon: String, _ color: Color) -> some View { HStack(spacing: 8) { Image(systemName: icon).foregroundColor(color); VStack(alignment: .leading, spacing: 1) { Text(value).font(.headline.monospacedDigit()); Text(title).font(.caption).foregroundColor(.secondary) }; Spacer() }.padding(12).frame(maxWidth: .infinity) }
     private var losColor: Color { ["A": .green, "B": .mint, "C": .yellow, "D": .orange, "E": .red, "F": .purple][los] ?? .secondary }
-    private func countdown(to session: RemoteAutoSession) -> String { guard let start = SessionDateParser.parse(session.startTime) else { return "Scheduled" }; let seconds = max(0, Int(start.timeIntervalSince(now))); return seconds == 0 ? "Starting now" : String(format: "Starts in %02d:%02d", seconds / 60, seconds % 60) }
-    private func formattedStart(_ session: RemoteAutoSession) -> String { guard let date = SessionDateParser.parse(session.startTime) else { return session.startTime }; return date.formatted(date: .omitted, time: .shortened) }
+    private func countdown(to session: RemoteAutoSession) -> String {
+        guard let start = SessionDateParser.parse(session.startTime) else { return "Scheduled" }
+        let seconds = Int(ceil(start.timeIntervalSince(now)))
+        return seconds <= 0 ? "Starting now" : "Starts in \(durationText(seconds))"
+    }
+
+    private func endCountdown(to session: RemoteAutoSession) -> String {
+        guard let endText = session.endTime,
+              let end = SessionDateParser.parse(endText) else { return "LIVE" }
+        let seconds = Int(ceil(end.timeIntervalSince(now)))
+        return seconds <= 0 ? "Ending now" : "Ends in \(durationText(seconds))"
+    }
+
+    private func durationText(_ totalSeconds: Int) -> String {
+        let safeSeconds = max(0, totalSeconds)
+        let hours = safeSeconds / 3600
+        let minutes = (safeSeconds % 3600) / 60
+        let seconds = safeSeconds % 60
+        return hours > 0
+            ? String(format: "%dh %02dm %02ds", hours, minutes, seconds)
+            : String(format: "%dm %02ds", minutes, seconds)
+    }
+
+    private func formattedStart(_ session: RemoteAutoSession) -> String {
+        guard let date = SessionDateParser.parse(session.startTime) else { return session.startTime }
+        return manilaTimeFormatter.string(from: date)
+    }
+
+    private func formattedEnd(_ session: RemoteAutoSession) -> String {
+        guard let endText = session.endTime,
+              let date = SessionDateParser.parse(endText) else { return "not specified" }
+        return manilaTimeFormatter.string(from: date)
+    }
+
+    private var manilaTimeFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Manila")
+        formatter.dateFormat = "h:mm a"
+        return formatter
+    }
     private func toggleCamera() {
         guard let camera = selectedCamera else { return }
         let nextState = !camera.isEnabled
@@ -249,14 +356,66 @@ struct CameraFeedView: View {
 @MainActor private struct ScheduleMiniCard: View {
     let session: RemoteAutoSession
     let now: Date
+
+    private var normalizedStatus: String { session.status.lowercased() }
     private var start: Date? { SessionDateParser.parse(session.startTime) }
-    private var statusColor: Color { ["active": .green, "scheduled": .orange, "ended": .purple][session.status.lowercased()] ?? .secondary }
+    private var end: Date? { session.endTime.flatMap(SessionDateParser.parse) }
+    private var statusColor: Color { ["active": .green, "scheduled": .orange, "ended": .purple][normalizedStatus] ?? .secondary }
+
     private var subtitle: String {
-        guard session.status.lowercased() == "scheduled", let start else { return start?.formatted(date: .abbreviated, time: .shortened) ?? session.startTime }
-        let seconds = max(0, Int(start.timeIntervalSince(now)))
-        return seconds == 0 ? "Starting now" : String(format: "Starts in %02d:%02d", seconds / 60, seconds % 60)
+        switch normalizedStatus {
+        case "scheduled":
+            guard let start else { return "Scheduled" }
+            let seconds = Int(ceil(start.timeIntervalSince(now)))
+            return seconds <= 0 ? "Starting now" : "Starts in \(durationText(seconds))"
+        case "active":
+            guard let end else { return "Counting now" }
+            let seconds = Int(ceil(end.timeIntervalSince(now)))
+            return seconds <= 0 ? "Ending now" : "Ends in \(durationText(seconds))"
+        default:
+            return start.map { manilaDateTimeFormatter.string(from: $0) } ?? session.startTime
+        }
     }
-    var body: some View { HStack { VStack(alignment: .leading, spacing: 3) { Text(session.schedule?.scheduleName ?? session.sessionCode).font(.caption.weight(.semibold)); Text(subtitle).font(.caption2.monospacedDigit()).foregroundColor(session.status.lowercased() == "scheduled" ? .orange : .secondary) }; Spacer(); Text(session.status.uppercased()).font(.caption2.bold()).foregroundColor(statusColor); Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundColor(.secondary) }.padding(9).background(Color.gray.opacity(0.08), in: RoundedRectangle(cornerRadius: 8)).contentShape(RoundedRectangle(cornerRadius: 8)) }
+
+    private func durationText(_ totalSeconds: Int) -> String {
+        let safeSeconds = max(0, totalSeconds)
+        let hours = safeSeconds / 3600
+        let minutes = (safeSeconds % 3600) / 60
+        let seconds = safeSeconds % 60
+        return hours > 0
+            ? String(format: "%dh %02dm %02ds", hours, minutes, seconds)
+            : String(format: "%dm %02ds", minutes, seconds)
+    }
+
+    private var manilaDateTimeFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Manila")
+        formatter.dateFormat = "MMM d, yyyy 'at' h:mm a"
+        return formatter
+    }
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(session.schedule?.scheduleName ?? session.sessionCode)
+                    .font(.caption.weight(.semibold))
+                Text(subtitle)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(statusColor)
+            }
+            Spacer()
+            Text(session.status.uppercased())
+                .font(.caption2.bold())
+                .foregroundColor(statusColor)
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.bold))
+                .foregroundColor(.secondary)
+        }
+        .padding(9)
+        .background(Color.gray.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+    }
 }
 
 @MainActor private struct CameraScheduleDetailView: View {
