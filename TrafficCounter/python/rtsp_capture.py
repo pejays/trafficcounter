@@ -22,20 +22,27 @@ camera_settings_revision = 0
 rtsp_url = None
 
 
-def build_rtsp_url(ip, username, password):
+STREAM_PATHS = {
+    "hikvision": "/Streaming/Channels/101",
+    "tapo": "/stream1",
+}
+
+
+def build_rtsp_url(ip, username, password, profile="hikvision"):
     host = (ip or "").strip()
     if not host:
         return None
     if host.startswith("rtsp://") or host.startswith("rtsps://"):
         return host
-    return "rtsp://{}:{}@{}/Streaming/Channels/101".format(
-        quote(username or "", safe=""), quote(password or "", safe=""), host
+    stream_path = STREAM_PATHS.get(profile, STREAM_PATHS["hikvision"])
+    return "rtsp://{}:{}@{}{}".format(
+        quote(username or "", safe=""), quote(password or "", safe=""), host, stream_path
     )
 
 
-def set_camera_settings(ip, username, password, persist=False):
+def set_camera_settings(ip, username, password, profile="hikvision", persist=False):
     global rtsp_url, camera_settings_revision
-    new_url = build_rtsp_url(ip, username, password)
+    new_url = build_rtsp_url(ip, username, password, profile)
     if new_url is None:
         return False
     with camera_settings_lock:
@@ -43,7 +50,7 @@ def set_camera_settings(ip, username, password, persist=False):
         camera_settings_revision += 1
     if persist:
         with open(CAMERA_SETTINGS_PATH, "w") as settings_file:
-            json.dump({"ip": ip, "username": username, "password": password}, settings_file)
+            json.dump({"ip": ip, "username": username, "password": password, "profile": profile}, settings_file)
     return True
 
 
@@ -52,7 +59,10 @@ def load_camera_settings():
         with open(CAMERA_SETTINGS_PATH, "r") as settings_file:
             settings = json.load(settings_file)
         return set_camera_settings(
-            settings.get("ip", ""), settings.get("username", ""), settings.get("password", "")
+            settings.get("ip", ""),
+            settings.get("username", ""),
+            settings.get("password", ""),
+            settings.get("profile", "hikvision"),
         )
     except (OSError, ValueError, TypeError):
         return False
@@ -179,6 +189,33 @@ def rotated_line(frame_width, frame_height):
     return slope, intercept
 
 
+def line_side(center_x, center_y, slope, intercept):
+    """Return which directed side of the counting line contains a centre.
+
+    Negative is the top/right approach side; positive is the bottom/left
+    exit side.  This formulation follows both the configured position and
+    rotation of the red line, instead of assuming that it is horizontal.
+    """
+    return center_y - (slope * center_x + intercept)
+
+
+def bbox_line_range(bbox, slope, intercept):
+    """Return the signed range of a box relative to the directed line.
+
+    A range containing zero means the bounding box has reached the red line.
+    This is more faithful to the counting-rule visual than waiting until a
+    vehicle's centre has travelled completely across it.
+    """
+    x1, y1, x2, y2 = bbox
+    sides = (
+        line_side(x1, y1, slope, intercept),
+        line_side(x1, y2, slope, intercept),
+        line_side(x2, y1, slope, intercept),
+        line_side(x2, y2, slope, intercept),
+    )
+    return min(sides), max(sides)
+
+
 def publish_preview(frame):
     """Encode a current camera frame without waiting for ML inference."""
     global latest_frame
@@ -263,13 +300,16 @@ def process_video():
         best_id, best_score = None, -1
         cx, cy = get_center(detection["bbox"])
         for vehicle_id, data in pool.items():
-            if data["class_name"] != detection["class_name"]:
-                continue
             px, py = get_center(data["bbox"])
             distance = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
             if distance > max_match_distance:
                 continue
             score = compute_iou(detection["bbox"], data["bbox"]) * 0.7 + max(0, 1 - distance / max_match_distance) * 0.3
+            # Prefer an unchanged classification, but do not discard the ID
+            # when a briefly flickering detector label changes (for example,
+            # a tricycle briefly reported as a motorcycle).
+            if data["class_name"] == detection["class_name"]:
+                score += 0.15
             if score > best_score:
                 best_id, best_score = vehicle_id, score
         return best_id
@@ -308,17 +348,47 @@ def process_video():
                     vehicle_id = next_vehicle_id
                     next_vehicle_id += 1
                     total_unique_ids.add(vehicle_id)
-                    active_vehicles[vehicle_id] = {"class_name": detection["class_name"], "bbox": detection["bbox"], "counted": False, "frames_lost": 0}
+                    active_vehicles[vehicle_id] = {
+                        "class_name": detection["class_name"],
+                        "bbox": detection["bbox"],
+                        "counted": False,
+                        # Tracks must first be observed in the permitted
+                        # top/right approach region. This prevents a vehicle
+                        # arriving from the prohibited bottom/left side from
+                        # being counted when its box touches the line.
+                        "seen_approach_side": False,
+                        "frames_lost": 0,
+                    }
             data = active_vehicles[vehicle_id]
-            previous_center_y = get_center(data["bbox"])[1]
+            previous_center_x, previous_center_y = get_center(data["bbox"])
             current_center_x, current_center_y = get_center(detection["bbox"])
-            current_line_y = slope * current_center_x + intercept
-            previous_line_y = slope * get_center(data["bbox"])[0] + intercept
-            if counting_enabled and previous_center_y < previous_line_y and current_center_y >= current_line_y and not data["counted"]:
+
+            previous_side = line_side(previous_center_x, previous_center_y, slope, intercept)
+            current_side = line_side(current_center_x, current_center_y, slope, intercept)
+            current_min_side, current_max_side = bbox_line_range(detection["bbox"], slope, intercept)
+            touches_counting_line = current_min_side <= 0 <= current_max_side
+
+            if previous_side < 0 or current_side < 0:
+                data["seen_approach_side"] = True
+
+            # A track may move far enough between detector frames that its
+            # centre skips directly past the line. Preserve that valid
+            # top/right-to-bottom/left crossing in addition to box contact.
+            crossed_past_line = previous_side < 0 <= current_side
+            reached_line_from_approach = data["seen_approach_side"] and (
+                touches_counting_line or crossed_past_line
+            )
+
+            # Count one time only when the stable tracker ID reaches the red
+            # line from the permitted top/right approach side. `counted`
+            # stays with the ID even while that box is temporarily moved to
+            # lost_vehicles because detections flicker.
+            if counting_enabled and reached_line_from_approach and not data["counted"]:
                 data["counted"] = True
-                class_name = detection["class_name"].lower()
+                class_name = data["class_name"].lower()
                 if class_name in vehicle_counts:
                     vehicle_counts[class_name] += 1
+                    print(f"Counted {class_name} with ID {vehicle_id} at the red line")
             data.update({"bbox": detection["bbox"], "frames_lost": 0})
             matched_ids.add(vehicle_id)
 
@@ -364,6 +434,7 @@ class FrameHandler(BaseHTTPRequestHandler):
                 query.get('ip', [''])[0],
                 query.get('username', [''])[0],
                 query.get('password', [''])[0],
+                query.get('profile', ['hikvision'])[0],
                 persist=False
             )
             self.send_response(200 if updated else 400)

@@ -16,6 +16,7 @@ struct CameraView: View {
     @State private var newCameraIP = ""
     @State private var newCameraUsername = "admin"
     @State private var newCameraPassword = ""
+    @State private var newCameraStreamProfile: CameraStreamProfile = .hikvision
     @State private var isTestingConnection = false
     @State private var connectionStatus: String? = nil
     @State private var isConnectionSuccessful = false
@@ -96,7 +97,6 @@ struct CameraView: View {
                         userId: userId,
                         userName: userName
                     )
-                    .id(selectedCamera.id)
                     .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
                 } else {
                     VStack {
@@ -150,6 +150,7 @@ struct CameraView: View {
                 newCameraIP: $newCameraIP,
                 newCameraUsername: $newCameraUsername,
                 newCameraPassword: $newCameraPassword,
+                newCameraStreamProfile: $newCameraStreamProfile,
                 isTestingConnection: $isTestingConnection,
                 connectionStatus: $connectionStatus,
                 isConnectionSuccessful: $isConnectionSuccessful,
@@ -312,7 +313,8 @@ struct CameraView: View {
                         remoteId: savedCam.id,
                         ip: newCameraIP,
                         username: newCameraUsername,
-                        password: newCameraPassword
+                        password: newCameraPassword,
+                        streamProfile: newCameraStreamProfile
                     )
                     cameras.append(newCamera)
                     saveCamerasToStorage()
@@ -341,6 +343,7 @@ struct CameraView: View {
         newCameraIP = ""
         newCameraUsername = "admin"
         newCameraPassword = ""
+        newCameraStreamProfile = .hikvision
         connectionStatus = nil
         isConnectionSuccessful = false
     }
@@ -357,44 +360,69 @@ struct CameraView: View {
         connectionStatus = "Testing RTSP connection & credentials..."
         isConnectionSuccessful = false
         
-        let rtspURL = "rtsp://\(newCameraUsername):\(newCameraPassword)@\(newCameraIP)/Streaming/Channels/101"
-        
-        // 2. We use /bin/bash to find ffmpeg, so it doesn't matter where it is installed
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/bash")
-        
-        // We wrap the command in quotes. We use -timeout instead of -stimeout for modern ffmpeg.
-        let command = "/opt/homebrew/bin/ffmpeg -rtsp_transport tcp -timeout 3000000 -i '\(rtspURL)' -frames:v 1 -f null - || /usr/local/bin/ffmpeg -rtsp_transport tcp -timeout 3000000 -i '\(rtspURL)' -frames:v 1 -f null -"
-        
-        task.arguments = ["-c", command]
-        
-        let pipe = Pipe()
-        task.standardError = pipe
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            
-            isTestingConnection = false
-            
-            if task.terminationStatus == 0 {
-                connectionStatus = "RTSP connection successful! Camera is reachable."
-                isConnectionSuccessful = true
-            } else {
-                // If it fails, we print the error to the console so you can see WHY
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                print("FFmpeg Test Failed Output:\n\(output)")
-                
-                connectionStatus = "RTSP connection failed. Check username, password, and IP."
-                isConnectionSuccessful = false
+        let draftCamera = Camera(
+            name: newCameraName,
+            ip: newCameraIP,
+            username: newCameraUsername,
+            password: newCameraPassword,
+            streamProfile: newCameraStreamProfile
+        )
+
+        // Run the short ffmpeg probe off the main thread and pass the RTSP URL
+        // as an argument rather than interpolating credentials into a shell.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ffmpegLocations = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            guard let ffmpegPath = ffmpegLocations.first(where: FileManager.default.isExecutableFile(atPath:)) else {
+                DispatchQueue.main.async {
+                    self.isTestingConnection = false
+                    self.connectionStatus = "Test failed: ffmpeg is not installed."
+                }
+                return
             }
-        } catch {
-            isTestingConnection = false
-            connectionStatus = "Test failed: Could not run ffmpeg."
-            isConnectionSuccessful = false
-            print("Process error: \(error)")
+
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: ffmpegPath)
+            task.arguments = [
+                "-rtsp_transport", "tcp",
+                "-timeout", "3000000",
+                "-i", draftCamera.rtspURL,
+                "-frames:v", "1",
+                "-f", "null", "-"
+            ]
+            let pipe = Pipe()
+            task.standardError = pipe
+
+            do {
+                try task.run()
+                task.waitUntilExit()
+                let succeeded = task.terminationStatus == 0
+                let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+                DispatchQueue.main.async {
+                    self.isTestingConnection = false
+                    self.isConnectionSuccessful = succeeded
+                    self.connectionStatus = succeeded
+                        ? "RTSP connection successful! Camera is reachable."
+                        : "RTSP connection failed. Check the camera account, IP address, and Wi-Fi network."
+                    if !succeeded { print("FFmpeg test failed: \(redactingRTSPCredentials(in: output))") }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isTestingConnection = false
+                    self.isConnectionSuccessful = false
+                    self.connectionStatus = "Test failed: Could not run ffmpeg."
+                    print("Process error: \(error)")
+                }
+            }
         }
+    }
+
+    private func redactingRTSPCredentials(in output: String) -> String {
+        output.replacingOccurrences(
+            of: #"rtsp://[^@\s]+@"#,
+            with: "rtsp://<credentials-redacted>@",
+            options: .regularExpression
+        )
     }
 }
 
@@ -404,6 +432,7 @@ struct AddCameraSheet: View {
     @Binding var newCameraIP: String
     @Binding var newCameraUsername: String
     @Binding var newCameraPassword: String
+    @Binding var newCameraStreamProfile: CameraStreamProfile
     @Binding var isTestingConnection: Bool
     @Binding var connectionStatus: String?
     @Binding var isConnectionSuccessful: Bool
@@ -420,7 +449,7 @@ struct AddCameraSheet: View {
     }
     
     var isTestConnectionValid: Bool {
-        !newCameraName.isEmpty && !newCameraIP.isEmpty && !newCameraUsername.isEmpty && !newCameraPassword.isEmpty
+        !newCameraName.isEmpty && isValidIPv4Address(newCameraIP) && !newCameraUsername.isEmpty && !newCameraPassword.isEmpty
     }
     
     var body: some View {
@@ -468,10 +497,36 @@ struct AddCameraSheet: View {
                 }
                 
                 VStack(alignment: .leading, spacing: 8) {
+                    Text("Camera Type")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                    Picker("Camera Type", selection: $newCameraStreamProfile) {
+                        ForEach(CameraStreamProfile.allCases) { profile in
+                            Text(profile.displayName).tag(profile)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: newCameraStreamProfile) { _, profile in
+                        if profile == .tapo, newCameraUsername == "admin" {
+                            newCameraUsername = ""
+                        } else if profile == .hikvision, newCameraUsername.isEmpty {
+                            newCameraUsername = "admin"
+                        }
+                        connectionStatus = nil
+                        isConnectionSuccessful = false
+                    }
+                    if newCameraStreamProfile == .tapo {
+                        Text("Use the separate Camera Account created in Tapo → Advanced Settings, not your Tapo sign-in.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
                     Text("IP Address")
                         .font(.subheadline)
                         .fontWeight(.medium)
-                    TextField("192.168.1.100", text: $newCameraIP)
+                    TextField("e.g., 192.168.1.100", text: $newCameraIP)
                         .textFieldStyle(.plain)
                         .padding(12)
                         .background(Color.gray.opacity(0.1))
@@ -556,7 +611,7 @@ struct AddCameraSheet: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 24)
         }
-        .frame(width: 500, height: 450)
+        .frame(width: 500, height: 530)
         .background(
             .regularMaterial,
             in: RoundedRectangle(cornerRadius: 20)
@@ -577,8 +632,17 @@ struct AddCameraSheet: View {
         newCameraIP = ""
         newCameraUsername = "admin"
         newCameraPassword = ""
+        newCameraStreamProfile = .hikvision
         connectionStatus = nil
         isConnectionSuccessful = false
+    }
+
+    private func isValidIPv4Address(_ value: String) -> Bool {
+        let octets = value.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ".")
+        return octets.count == 4 && octets.allSatisfy { octet in
+            guard let number = Int(octet), String(number) == octet || octet == "0" else { return false }
+            return (0...255).contains(number)
+        }
     }
 }
 

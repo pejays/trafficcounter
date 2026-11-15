@@ -195,11 +195,15 @@ final class AutoSessionCoordinator: ObservableObject {
     }
 
     func submitCounts(_ counts: [Int]) async {
-        guard counts.count == 8,
-              let session = activeSession,
+        guard counts.count == 8 else { return }
+        latestCounts = counts
+
+        // Retain the newest raw detector values even if the website closes the
+        // session in the same moment. refresh() uses this snapshot for the
+        // final write, so a completed session cannot fall back to stale zeros.
+        guard let session = activeSession,
               !isSendingCounts else { return }
 
-        latestCounts = counts
         guard counts != lastSentCounts else { return }
         isSendingCounts = true
         defer { isSendingCounts = false }

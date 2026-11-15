@@ -298,7 +298,7 @@ struct EditLineSheet: View {
                     PythonCameraHandler().updateCountingLine(position: linePosition)
                 })
             }
-            
+
             // 2. Rotation Slider
             VStack(alignment: .leading, spacing: 8) {
                 Text("Rotation: \(Int(lineAngle))°")

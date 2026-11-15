@@ -20,21 +20,27 @@ class PythonCameraHandler: NSObject, ObservableObject {
     
     private var process: Process?
     private var frameTimer: Timer?
+    private var countsTimer: Timer?
     private var session: URLSession?
     private var isServerReady = false
     private var isFetchingFrame = false
     private var isFetchingCounts = false
     private var cameraRequested = false
     private var readinessAttempts = 0
+    // Invalidates queued launches when a camera is changed or disabled before
+    // the previous helper startup has completed.
+    private var launchGeneration = 0
     // The Python helper adapts its production rate to available CPU. Poll at
     // the 30 FPS ceiling so Swift renders every frame the helper can provide.
     private let previewFrameInterval: TimeInterval = 1.0 / 30.0
     private let processQueue = DispatchQueue(label: "TrafficCounter.camera-process", qos: .userInitiated)
     
     func startCamera() {
+        cameraRequested = true
         guard !isStarting, process?.isRunning != true else { return }
         isStarting = true
-        cameraRequested = true
+        launchGeneration &+= 1
+        let generation = launchGeneration
         lastError = nil
         
         print("Starting Python RTSP handler...")
@@ -52,6 +58,12 @@ class PythonCameraHandler: NSObject, ObservableObject {
         // Remove only a stale copy of this project's helper. The former global
         // pkill and force-kill-on-port could disrupt unrelated local services.
         processQueue.async { [weak self] in
+            let shouldLaunch = DispatchQueue.main.sync {
+                guard let self else { return false }
+                return self.cameraRequested && self.launchGeneration == generation && self.process?.isRunning != true
+            }
+            guard shouldLaunch else { return }
+
             let staleProcess = Process()
             staleProcess.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
             staleProcess.arguments = ["-f", scriptURL.path]
@@ -59,6 +71,7 @@ class PythonCameraHandler: NSObject, ObservableObject {
             staleProcess.waitUntilExit()
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                guard self?.launchGeneration == generation else { return }
                 self?.launchCameraService(scriptURL: scriptURL)
             }
         }
@@ -106,16 +119,18 @@ class PythonCameraHandler: NSObject, ObservableObject {
             
             currentCameraName = cameraName
             print("Loaded saved camera: \(cameraName) at \(cameraIP)")
-            updateCameraSettings(ip: cameraIP, username: username, password: password)
+            let profile = CameraStreamProfile(rawValue: defaults.string(forKey: "saved_camera_stream_profile") ?? "") ?? .hikvision
+            updateCameraSettings(ip: cameraIP, username: username, password: password, streamProfile: profile)
         }
     }
     
-    func updateCameraSettings(ip: String, username: String, password: String) {
+    func updateCameraSettings(ip: String, username: String, password: String, streamProfile: CameraStreamProfile = .hikvision) {
         var components = URLComponents(string: "http://127.0.0.1:8888/update")
         components?.queryItems = [
             URLQueryItem(name: "ip", value: ip),
             URLQueryItem(name: "username", value: username),
-            URLQueryItem(name: "password", value: password)
+            URLQueryItem(name: "password", value: password),
+            URLQueryItem(name: "profile", value: streamProfile.rawValue)
         ]
         guard let url = components?.url else { return }
         session?.dataTask(with: url) { data, response, error in
@@ -148,6 +163,11 @@ class PythonCameraHandler: NSObject, ObservableObject {
                     }
                     
                     self.frameTimer = Timer.scheduledTimer(timeInterval: self.previewFrameInterval, target: self, selector: #selector(self.fetchFrame), userInfo: nil, repeats: true)
+                    // Keep count delivery independent from preview JPEG
+                    // rendering. A slow frame response must never prevent
+                    // Swift from reading Python's detector totals.
+                    self.countsTimer = Timer.scheduledTimer(timeInterval: 0.25, target: self, selector: #selector(self.fetchCounts), userInfo: nil, repeats: true)
+                    self.fetchCounts()
                     print("Camera connected via Python HTTP")
                 }
             } else {
@@ -176,36 +196,48 @@ class PythonCameraHandler: NSObject, ObservableObject {
             }
         }.resume()
         
-        guard !isFetchingCounts,
+    }
+
+    @objc func fetchCounts() {
+        guard isServerReady,
+              let session,
+              !isFetchingCounts,
               let countsUrl = URL(string: "http://127.0.0.1:8888/counts") else { return }
         isFetchingCounts = true
         session.dataTask(with: countsUrl) { [weak self] data, _, _ in
             DispatchQueue.main.async { self?.isFetchingCounts = false }
             if let data = data {
                 if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Int] {
-                    DispatchQueue.main.async { self?.vehicleCounts = json }
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        if self.vehicleCounts != json {
+                            self.vehicleCounts = json
+                            print("Detector count snapshot received: \(json)")
+                        }
+                    }
                 }
             }
         }.resume()
     }
     
-    func saveCameraToUserDefaults(name: String, ip: String, username: String, password: String) {
+    func saveCameraToUserDefaults(name: String, ip: String, username: String, password: String, streamProfile: CameraStreamProfile = .hikvision) {
         let defaults = UserDefaults.standard
         defaults.set(name, forKey: "saved_camera_name")
         defaults.set(ip, forKey: "saved_camera_ip")
         defaults.set(username, forKey: "saved_camera_username")
         defaults.set(password, forKey: "saved_camera_password")
+        defaults.set(streamProfile.rawValue, forKey: "saved_camera_stream_profile")
         
         currentCameraName = name
         
-        let settings = ["ip": ip, "username": username, "password": password]
+        let settings = ["ip": ip, "username": username, "password": password, "profile": streamProfile.rawValue]
         if let jsonData = try? JSONSerialization.data(withJSONObject: settings),
            let jsonString = String(data: jsonData, encoding: .utf8) {
             let filePath = "/tmp/camera_settings.json"
             try? jsonString.write(toFile: filePath, atomically: true, encoding: .utf8)
         }
         
-        updateCameraSettings(ip: ip, username: username, password: password)
+        updateCameraSettings(ip: ip, username: username, password: password, streamProfile: streamProfile)
     }
     
     func updateCountingLine(position: Double) {
@@ -219,11 +251,14 @@ class PythonCameraHandler: NSObject, ObservableObject {
         guard let url = URL(string: "http://127.0.0.1:8888/update_angle?a=\(angle)") else { return }
         URLSession.shared.dataTask(with: url).resume()
     }
-    
-    func stopCamera() {
+
+    func stopCamera(reason: String = "requested by the operator") {
+        launchGeneration &+= 1
         cameraRequested = false
         frameTimer?.invalidate()
         frameTimer = nil
+        countsTimer?.invalidate()
+        countsTimer = nil
         session?.invalidateAndCancel()
         session = nil
         process?.terminate()
@@ -232,7 +267,7 @@ class PythonCameraHandler: NSObject, ObservableObject {
         isFetchingFrame = false
         isFetchingCounts = false
         DispatchQueue.main.async { self.isConnected = false }
-        print("Python camera stopped")
+        print("Python camera stopped (\(reason))")
     }
     
     func refreshCameraFeed() {

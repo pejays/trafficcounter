@@ -59,3 +59,71 @@ Checklist source: .freebuff/skills/trafficcounter-verify.md
   view-bound Swift concurrency task that refreshes the displayed clock once
   per second through normal SwiftUI redraws.
 
+# Protected automatic-session persistence — 2026-11-12
+
+- Desktop automatic-session activation, live count updates, and completion now
+  use the authenticated VehiSights Laravel API instead of direct public-role
+  Supabase writes to `auto_session_details`.
+- The Laravel endpoint keeps Supabase RLS enabled and calculates PCU, V/C,
+  LOS, and final traffic history server-side.
+
+# Tapo C210 RTSP profile — 2026-11-15
+
+- Added a Tapo C210 stream profile that uses `/stream1`; existing saved
+  cameras decode with the Hikvision-compatible profile by default.
+- The add-camera RTSP probe now invokes ffmpeg with an argument array on a
+  background queue, avoiding a credential-interpolated shell command and UI
+  blocking; failed probe output redacts RTSP credentials before console logs.
+- Verified with `python3 -m py_compile TrafficCounter/python/rtsp_capture.py`
+  and `xcodebuild -project TrafficCounter.xcodeproj -scheme TrafficCounter
+  -configuration Debug -sdk macosx build CODE_SIGNING_ALLOWED=NO`.
+
+# Camera switching stability — 2026-11-15
+
+- Camera selection no longer recreates `CameraFeedView`; it reconfigures the
+  running helper for the selected camera.
+- Queued Python helper launches use a generation guard, preventing a stale
+  camera selection from stopping the newer helper after a rapid switch.
+- Removed child-view `onDisappear` shutdown because it could terminate a
+  replacement RTSP helper after a SwiftUI camera selection transition.
+
+# Directed red-line counting — 2026-11-15
+
+- Counting now uses the signed side of the dynamic, rotated line: only a
+  tracker ID moving from its top/right approach side to its bottom/left exit
+  side is eligible; reverse crossings are ignored.
+- A track retains its `counted` flag while it is briefly absent from the model
+  output, preventing repeated counts when its bounding box flickers.
+- Verified with `python3 -m py_compile TrafficCounter/python/rtsp_capture.py`.
+- Revised the trigger from centre-only crossing to bounding-box contact from
+  the permitted approach side, while retaining ID-based duplicate prevention
+  and reverse-direction rejection. `python3 -m py_compile
+  TrafficCounter/python/rtsp_capture.py` passed after the revision.
+
+# Direct automatic-session count synchronization — 2026-11-15
+
+- Automatic-session activation, changing live counts, and completion now use
+  the existing direct Supabase REST client used for camera persistence.
+- Live count persistence is an `auto_session_id` upsert, so it updates one
+  Auto Records detail row rather than creating duplicate rows; completion
+  writes the final snapshot before setting `auto_sessions.status` to `ended`.
+- Pending verification: build the macOS app and run one short scheduled
+  session against the shared Supabase project. Confirm `counts` changes in
+  `auto_session_details` during the session and remains as the final values
+  after it ends.
+- `xcodebuild -project TrafficCounter.xcodeproj -scheme TrafficCounter
+  -configuration Debug -sdk macosx build CODE_SIGNING_ALLOWED=NO` — Passed.
+  Existing project warnings remain for the absent optional FFmpeg library
+  search path and duplicated Info.plist bundle resource.
+- Added a required upsert response check and a non-sensitive Xcode console
+  confirmation for each saved automatic-session count snapshot. Build passed
+  again after this change.
+- Detector count changes now submit their raw eight-category snapshot
+  immediately, rather than waiting solely for the two-second safety timer.
+  The coordinator retains that raw snapshot before checking session state, so
+  the final completion write cannot accidentally replace detected values with
+  the zero display state during an end-of-session transition.
+- Python detector totals are polled on their own 250 ms timer. Previously a
+  pending preview JPEG request skipped the entire `/counts` request, which
+  could upload zeros despite Python having logged red-line crossings.
+

@@ -282,100 +282,77 @@ class SupabaseManager {
     }
 
     func activateAutoSession(_ session: RemoteAutoSession) async throws {
+        // Keep automatic-session state on the same direct Supabase connection
+        // used by camera creation. This makes the desktop independent from an
+        // ngrok/Laravel bridge while the website continues to read the same row.
         _ = try await request(
             table: "auto_sessions",
             queryItems: [URLQueryItem(name: "id", value: "eq.\(session.id)")],
             method: "PATCH",
-            body: ["status": "active"]
-        )
-
-        let now = timestamp(Date())
-        _ = try await request(
-            table: "schedule_logs",
-            queryItems: [
-                URLQueryItem(name: "auto_session_id", value: "eq.\(session.id)"),
-                URLQueryItem(name: "status", value: "eq.pending")
-            ],
-            method: "PATCH",
-            body: ["status": "running", "started_at": now]
+            body: [
+                "status": "active",
+                "updated_at": timestamp(Date())
+            ]
         )
     }
 
     func updateLiveCounts(_ session: RemoteAutoSession, counts: [Int]) async throws {
         let metrics = metrics(for: session, counts: counts)
-        let body: [String: Any] = [
-            "auto_session_id": session.id,
-            "counts": metrics.counts,
-            "pcu_totals": metrics.pcuTotals,
-            "total_pcu": metrics.totalPcu,
-            "vc_ratio": metrics.vcRatio,
-            "los": metrics.los,
-            "source": "auto",
-            "updated_at": timestamp(Date())
-        ]
-        _ = try await request(
+
+        // `auto_session_id` is unique. The merge means the first live update
+        // creates the detail row and each following update replaces that same
+        // row, so Auto Records receives current counts without duplicate rows.
+        let responseData = try await request(
             table: "auto_session_details",
-            queryItems: [URLQueryItem(name: "on_conflict", value: "auto_session_id")],
+            queryItems: [
+                URLQueryItem(name: "on_conflict", value: "auto_session_id")
+            ],
             method: "POST",
-            body: body,
+            body: [
+                "auto_session_id": session.id,
+                "counts": metrics.counts,
+                "pcu_totals": metrics.pcuTotals,
+                "total_pcu": metrics.totalPcu,
+                "vc_ratio": metrics.vcRatio,
+                "los": metrics.los,
+                "source": "auto",
+                "updated_at": timestamp(Date())
+            ],
             prefer: "resolution=merge-duplicates,return=representation"
         )
+
+        let savedDetails = try JSONDecoder().decode(
+            [RemoteAutoSessionDetail].self,
+            from: responseData
+        )
+        guard savedDetails.contains(where: { $0.autoSessionId == session.id }) else {
+            throw NSError(
+                domain: "Supabase",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Supabase did not confirm the saved live count for session \(session.sessionCode)."
+                ]
+            )
+        }
+
+        print("Live counts saved to Supabase for session \(session.sessionCode): \(metrics.counts)")
     }
 
     func completeAutoSession(_ session: RemoteAutoSession, counts: [Int]) async throws {
+        // Always commit one final count snapshot before marking the session
+        // ended. This preserves detected vehicles even if the website closes
+        // the session immediately afterwards.
         try await updateLiveCounts(session, counts: counts)
-        let now = timestamp(Date())
 
         _ = try await request(
             table: "auto_sessions",
             queryItems: [URLQueryItem(name: "id", value: "eq.\(session.id)")],
             method: "PATCH",
-            body: ["status": "ended", "updated_at": now]
-        )
-        _ = try await request(
-            table: "schedule_logs",
-            queryItems: [URLQueryItem(name: "auto_session_id", value: "eq.\(session.id)")],
-            method: "PATCH",
-            body: ["status": "success", "completed_at": now]
-        )
-
-        if let cameraID = session.cameraId {
-            _ = try await request(
-                table: "cameras",
-                queryItems: [URLQueryItem(name: "id", value: "eq.\(cameraID)")],
-                method: "PATCH",
-                body: ["last_detection_at": now]
-            )
-        }
-        if let schedule = session.schedule, schedule.recurrence?.lowercased() == "once" {
-            _ = try await request(
-                table: "schedules",
-                queryItems: [URLQueryItem(name: "id", value: "eq.\(schedule.id)")],
-                method: "PATCH",
-                body: ["is_active": false, "updated_at": now]
-            )
-        }
-
-        let result = metrics(for: session, counts: counts)
-        var history: [String: Any] = [
-            "auto_session_id": session.id,
-            "road_name": session.roadName ?? session.location,
-            "direction": session.direction ?? "",
-            "hour_timestamp": session.startTime,
-            "total_pcu": result.totalPcu,
-            "vc_ratio": result.vcRatio,
-            "los": result.los,
-            "counts": result.counts,
-            "source": "auto",
-            "updated_at": now
-        ]
-        if let cameraID = session.cameraId { history["camera_id"] = cameraID }
-        _ = try await request(
-            table: "traffic_history",
-            queryItems: [URLQueryItem(name: "on_conflict", value: "auto_session_id")],
-            method: "POST",
-            body: history,
-            prefer: "resolution=merge-duplicates,return=minimal"
+            body: [
+                "status": "ended",
+                "updated_at": timestamp(Date())
+            ]
         )
     }
 

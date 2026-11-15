@@ -60,6 +60,13 @@ struct CameraFeedView: View {
             synchronizeCountingState(resetForNewSession: true)
         }
         .onChange(of: shouldMaintainFeed) { _, _ in startFeedIfNeeded() }
+        // Keep one feed view and reconfigure the local helper when the
+        // operator selects another camera. Recreating this view used to stop
+        // the Python process and race its replacement startup.
+        .onChange(of: selectedCamera?.id) { _, _ in
+            startFeedIfNeeded()
+            synchronizeCountingState(resetForNewSession: true)
+        }
         .onChange(of: sessionCoordinator.activeSession?.id) { _, _ in
             startFeedIfNeeded()
             synchronizeCountingState(resetForNewSession: true)
@@ -75,7 +82,17 @@ struct CameraFeedView: View {
                 cameraHandler.stopCamera()
             }
         }
-        .onReceive(liveUploadTimer) { _ in if isAssignedActiveCamera { Task { await sessionCoordinator.submitCounts(orderedCounts) } } }
+        // Publish immediately when Python reports a changed count. The timer
+        // remains a low-frequency safety net, but must not be the only route
+        // from the detector to Supabase.
+        .onChange(of: cameraHandler.vehicleCounts) { _, _ in
+            Task { await sessionCoordinator.submitCounts(rawOrderedCounts) }
+        }
+        .onReceive(liveUploadTimer) { _ in
+            if isAssignedActiveCamera {
+                Task { await sessionCoordinator.submitCounts(rawOrderedCounts) }
+            }
+        }
         // Keep countdown text driven by a task owned by this view. A Combine
         // publisher stored in a SwiftUI value can be recreated during redraws,
         // leaving its displayed countdown frozen.
@@ -85,7 +102,11 @@ struct CameraFeedView: View {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
-        .onDisappear { cameraHandler.stopCamera() }
+        // Do not stop the shared helper here. SwiftUI can transiently remove
+        // the old feed view while another camera is selected; its onDisappear
+        // would otherwise terminate the replacement RTSP process after it has
+        // started. The helper should also keep feeding while the operator
+        // changes app tabs. Explicit Disable remains the shutdown action.
         .sheet(item: $selectedSchedule) { session in
             CameraScheduleDetailView(session: session)
         }
@@ -335,7 +356,13 @@ struct CameraFeedView: View {
 
     private func startFeedIfNeeded() {
         guard shouldRunFeed, let camera = selectedCamera, camera.isEnabled else { return }
-        cameraHandler.saveCameraToUserDefaults(name: camera.name, ip: camera.ip, username: camera.username, password: camera.password)
+        cameraHandler.saveCameraToUserDefaults(
+            name: camera.name,
+            ip: camera.ip,
+            username: camera.username,
+            password: camera.password,
+            streamProfile: camera.streamProfile
+        )
         cameraHandler.startCamera()
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
             guard let currentCamera = selectedCamera else { return }

@@ -75,6 +75,26 @@ Living notes about the system. Update whenever a fact changes.
 - Camera selection must remain stable during Supabase polling. Replacing a
   semantically identical `Camera` value creates a new UUID and causes SwiftUI
   to recreate `CameraFeedView`, which stops and restarts the RTSP helper.
+- Camera configurations carry a stream profile. Existing cameras retain the
+  Hikvision-compatible `/Streaming/Channels/101` path, while the Tapo C210
+  profile uses its local RTSP high-quality `/stream1` path. The selected
+  profile is passed from Swift to the loopback-only Python helper.
+- The RTSP connection probe redacts credentials before writing ffmpeg errors
+  to the Xcode console.
+- Switching the selected camera keeps the `CameraFeedView` mounted and sends
+  the new configuration to the existing Python helper. Queued helper launches
+  are generation-guarded so an old camera selection cannot kill a replacement
+  process.
+- `CameraFeedView` must never stop the shared RTSP helper in `onDisappear`.
+  SwiftUI may remove the old view during a camera selection change, after the
+  replacement helper has started. The helper remains active across camera and
+  app-tab changes and stops only through an explicit Disable action.
+- The counting region is the directed half-plane above/right of the dynamic
+  red line. A tracked ID counts once when its bounding box reaches that line
+  from the approach side (or its centre skips past the line between detector
+  frames); reverse-side entries never count. ID matching spans short missing
+  boxes and brief class-label flicker, and the `counted` flag is retained with
+  the ID while it is temporarily lost.
 - Live automatic-session counts use an `auto_session_id` conflict upsert. A
   final desktop snapshot is written when an active session transitions out of
   the active window, including when the website closes it first.
@@ -83,4 +103,23 @@ Living notes about the system. Update whenever a fact changes.
 - Camera schedule and active-session countdowns use a view-bound one-second
   task rather than a recreated Combine publisher, so time remaining continues
   to update while the camera console redraws.
+- Automatic-session activation, live count snapshots, and completion use the
+  same direct Supabase REST connection as camera save/update operations. The
+  desktop upserts one `auto_session_details` row per `auto_session_id` every
+  time the counter changes (normally every two seconds), then saves one final
+  snapshot before marking the session ended. This avoids dependence on a
+  separate ngrok/Laravel connection and lets the website read the same shared
+  rows in real time.
+- The desktop treats an automatic-session count upload as successful only when
+  Supabase returns the upserted `auto_session_details` row for that exact
+  session. The Xcode console logs the confirmed session code and eight
+  category counts; absence of this confirmation means no result was saved.
+- Python `/counts` changes are bridged to the automatic-session coordinator
+  immediately. The two-second timer is only a backup; it is not the source of
+  truth. Raw counts are retained before a session-state check so a session
+  ending at the same moment as a detector update still completes with the
+  detected values instead of an inactive-view zero array.
+- Preview frame fetching and detector-count fetching are independent. The
+  local helper's `/counts` endpoint is polled every 250 ms, so a delayed
+  RTSP-to-JPEG preview response cannot starve automatic-session persistence.
 
